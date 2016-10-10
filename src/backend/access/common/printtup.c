@@ -181,6 +181,8 @@ typedef struct  {
 	char *compression_buffer;
 	char **base_pointers;
 	char **data_pointers;
+	bool *data_is_string;
+	size_t *attribute_lengths;
 	size_t transferred_count;
 	size_t tuples_per_chunk;
 	size_t total_tuples_send;
@@ -211,6 +213,8 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	int			i;
 	StringInfoData buf;
 	ListCell   *tlist_item = list_head(targetlist);
+	char *baseptr;
+	size_t rowsize;
 
 	if (!initialized) {
 		rsbuf.maxsize = CHUNK_SIZE;
@@ -220,27 +224,47 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	} else {
 		free(rsbuf.base_pointers);
 		free(rsbuf.data_pointers);
+		free(rsbuf.data_is_string);
+		free(rsbuf.attribute_lengths);
 	}
 	rsbuf.transferred_count = 0;
-	rsbuf.tuples_per_chunk = 0; // FIXME
+	rsbuf.tuples_per_chunk = 0;
 	rsbuf.total_tuples_send = 0;
 	rsbuf.total_tuples = 0; // FIXME
 	rsbuf.count = 0;
 	rsbuf.base_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_pointers = malloc(sizeof(char*) * natts);
+	rsbuf.data_is_string = malloc(sizeof(bool) * natts);
+	rsbuf.attribute_lengths = malloc(sizeof(size_t) * natts);
 
-	rsbuf.buffer[0] = '*'; // new result set message
-	size_t rowsize = 0;
-	char *baseptr = rsbuf.buffer + sizeof(size_t) * 2 + sizeof(char);
+	baseptr = rsbuf.buffer + sizeof(size_t); // new result set message
+	rowsize = 0;
 	for (i = 0; i < natts; ++i) {
+		char category;
+		bool preferred;
+		ssize_t attribute_length = attrs[i]->attlen;
+		get_type_category_preferred(attrs[i]->atttypid, &category, &preferred);
+		if ((rsbuf.data_is_string[i] = (category == 'S'))) {
+			attribute_length = attrs[i]->atttypmod - 4 + 1; // null terminator
+		}
+		if (category == 'D') {
+			attribute_length = 4; // dates are stored as 4-byte integers
+		}
+		rsbuf.attribute_lengths[i] = attribute_length;
+		rowsize += attribute_length;
+
 		rsbuf.base_pointers[i] = baseptr;
 		rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
-		baseptr += rsbuf.tuples_per_chunk * attrs[i]->attlen;
-		rowsize += attrs[i]->attlen;
-		Assert(attrs[i]->attlen > 0);
+
+		baseptr += rsbuf.tuples_per_chunk * attribute_length;
+		if (rsbuf.data_is_string[i]) {
+			baseptr += sizeof(size_t);
+		}
+		Assert(attribute_length > 0);
 	}
-	rsbuf.total_tuples_send = rsbuf.maxsize / rowsize;
-	Assert(rsbuf.total_tuples_send > 0);
+	rsbuf.tuples_per_chunk = CHUNK_SIZE / rowsize;
+
+	Assert(rsbuf.tuples_per_chunk > 0);
 
 	pq_beginmessage(&buf, 'T'); /* tuple descriptor message type */
 	pq_sendint(&buf, natts, 2); /* # of attrs in tuples */
@@ -354,37 +378,59 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	StringInfoData buf;
 	int			natts = typeinfo->natts;
 	int			i;
-	int TYPE_STRING = -1;
+
+	/* Make sure the tuple is fully deconstructed */
+	slot_getallattrs(slot);
 
 	// copy the data of this row into the buffer
 	for (i = 0; i < natts; ++i) {
 		char *buffer_pointer = rsbuf.data_pointers[i];
 		Datum attr = slot->tts_values[i];
-		if (slot->tts_isnull[i]) {
-			memset(buffer_pointer, 1, typeinfo->attrs[i]->attlen);
-		} else {
-			memcpy(buffer_pointer, &attr, typeinfo->attrs[i]->attlen);
-		}
-		rsbuf.data_pointers[i] += typeinfo->attrs[i]->attlen;
-		if (typeinfo->attrs[i]->atttypid == TYPE_STRING) {
-			rsbuf.data_pointers[i] = '\0';
+		if (rsbuf.data_is_string[i]) {
+			if (slot->tts_isnull[i]) {
+				memset(buffer_pointer, 1, rsbuf.attribute_lengths[i]);
+			} else {
+				memcpy(buffer_pointer, attr + 1, rsbuf.attribute_lengths[i]);
+			}
+			// todo: proper strcpy for varchar
+			rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i] - 1;
+			(*rsbuf.data_pointers[i]) = '\0';
 			rsbuf.data_pointers[i] += 1;
+		} else {
+			if (slot->tts_isnull[i]) {
+				memset(buffer_pointer, 1, rsbuf.attribute_lengths[i]);
+			} else {
+				memcpy(buffer_pointer, &attr, rsbuf.attribute_lengths[i]);
+			}
+			rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
 		}
+		/*if (i == 0 || i == 1 || i == 2 || i == 3 || i == 10 || i == 11 || i == 12) {
+			printf("%d, ", *((int*)buffer_pointer));
+		} else if (i == 8 || i == 9 || i == 13 || i == 14) {
+			printf("\"%s\", ", (char*) buffer_pointer);
+		} else if (i == 15) {
+			printf("%s", (char*) buffer_pointer);
+		} else {
+			printf("%lf, ", *((double*) buffer_pointer));
+		}*/
 	}
+	//printf("\n");
 	rsbuf.count++;
 	// check if the buffer is full; if it is, we send it
-	if (rsbuf.count > rsbuf.tuples_per_chunk || rsbuf.total_tuples_send + rsbuf.count >= rsbuf.total_tuples) {
-		*((size_t*) rsbuf.buffer + sizeof(char)) = rsbuf.base_pointers[natts - 1] - rsbuf.buffer + sizeof(size_t); // amount of data in the chunk
-		*((size_t*) rsbuf.buffer + sizeof(char) + sizeof(size_t)) = rsbuf.count; // amount of rows to send
+	if (rsbuf.count > rsbuf.tuples_per_chunk) {
+		//printf("Packet %zu-%zu.\n", rsbuf.total_tuples_send, rsbuf.total_tuples_send + rsbuf.count);
+		size_t chunk_data = rsbuf.data_pointers[natts - 1] - rsbuf.buffer + sizeof(size_t);
+		*((size_t*) rsbuf.buffer) = rsbuf.count; // amount of rows to send
 		for (i = 0; i < natts; ++i) {
-			if (typeinfo->attrs[i]->atttypid == TYPE_STRING) {
+			if (rsbuf.data_is_string[i]) {
 				// set the length of the message in the buffer for string types
 				*((size_t*)(rsbuf.base_pointers[i] - 0x8)) = rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
 			}
 			// reset the base pointer for the next time something is send
 			rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
 		}
-		// FIXME: actually send to client
+		// actually send the message to the client
+		pq_putmessage('*', rsbuf.buffer, chunk_data);
 		rsbuf.total_tuples_send += rsbuf.count;
 		rsbuf.count = 0;
 	}
