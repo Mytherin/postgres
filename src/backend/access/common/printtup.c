@@ -179,6 +179,7 @@ typedef struct  {
 	size_t maxsize;
 	char *buffer;
 	char *compression_buffer;
+	char **bitmask_pointers;
 	char **base_pointers;
 	char **data_pointers;
 	bool *data_is_string;
@@ -192,6 +193,9 @@ typedef struct  {
 
 static bool initialized = false;
 static ResultSetBuffer rsbuf;
+
+// align number to nearest multiple of eight (e.g. eightalign(15) = 16, eightalign(8) = 8, eightalign(9) = 16)
+#define eightalign(sz) ((sz + 7) & ~7)
 
 /*
  * SendRowDescriptionMessage --- send a RowDescription message to the frontend
@@ -222,6 +226,7 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		rsbuf.compression_buffer = malloc(CHUNK_SIZE); // FIXME: max compression size
 		initialized = true;
 	} else {
+		free(rsbuf.bitmask_pointers);
 		free(rsbuf.base_pointers);
 		free(rsbuf.data_pointers);
 		free(rsbuf.data_is_string);
@@ -232,13 +237,14 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	rsbuf.total_tuples_send = 0;
 	rsbuf.total_tuples = 0; // FIXME
 	rsbuf.count = 0;
+	rsbuf.bitmask_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.base_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_is_string = malloc(sizeof(bool) * natts);
 	rsbuf.attribute_lengths = malloc(sizeof(size_t) * natts);
 
-	baseptr = rsbuf.buffer + sizeof(size_t); // new result set message
-	rowsize = 0;
+	// rowsize in bits
+	rowsize = natts; // reserve one bit per attribute for the null mask
 	for (i = 0; i < natts; ++i) {
 		char category;
 		bool preferred;
@@ -251,18 +257,25 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 			attribute_length = 4; // dates are stored as 4-byte integers
 		}
 		rsbuf.attribute_lengths[i] = attribute_length;
-		rowsize += attribute_length;
+		rowsize += attribute_length * 8; //attribute length is given in 
+		Assert(attribute_length > 0); // FIXME: deal with Blobs
+	}
+	// only consider chunks of eight rows for easy bitmask alignment
+	rsbuf.tuples_per_chunk = (8 * 8 * (CHUNK_SIZE - sizeof(size_t) - 1)) / (8 * rowsize);
+
+	// bitmask size per column in bytes
+	size_t bitmask_size = eightalign(rsbuf.tuples_per_chunk) / 8;
+	baseptr = rsbuf.buffer + sizeof(size_t); // new result set message
+	for (i = 0; i < natts; ++i) {
+		rsbuf.bitmask_pointers[i] = baseptr;
+		baseptr += bitmask_size;
+		memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with NULL values
 
 		rsbuf.base_pointers[i] = baseptr;
 		rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
 
-		baseptr += rsbuf.tuples_per_chunk * attribute_length;
-		if (rsbuf.data_is_string[i]) {
-			baseptr += sizeof(size_t);
-		}
-		Assert(attribute_length > 0);
+		baseptr += rsbuf.tuples_per_chunk * rsbuf.attribute_lengths[i];
 	}
-	rsbuf.tuples_per_chunk = CHUNK_SIZE / rowsize;
 
 	Assert(rsbuf.tuples_per_chunk > 0);
 
@@ -382,50 +395,41 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	/* Make sure the tuple is fully deconstructed */
 	slot_getallattrs(slot);
 
+	rsbuf.count++;
 	// copy the data of this row into the buffer
 	for (i = 0; i < natts; ++i) {
 		char *buffer_pointer = rsbuf.data_pointers[i];
 		Datum attr = slot->tts_values[i];
-		if (rsbuf.data_is_string[i]) {
-			if (slot->tts_isnull[i]) {
-				memset(buffer_pointer, 1, rsbuf.attribute_lengths[i]);
-			} else {
-				memcpy(buffer_pointer, attr + 1, rsbuf.attribute_lengths[i]);
-			}
-			// todo: proper strcpy for varchar
-			rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i] - 1;
-			(*rsbuf.data_pointers[i]) = '\0';
-			rsbuf.data_pointers[i] += 1;
+		if (slot->tts_isnull[i]) {
+			// set bit in null mask
+			size_t byte = rsbuf.count / 8;
+			int bit = rsbuf.count % 8;
+			rsbuf.bitmask_pointers[i][byte] |= 1 << bit;
 		} else {
-			if (slot->tts_isnull[i]) {
-				memset(buffer_pointer, 1, rsbuf.attribute_lengths[i]);
+			if (rsbuf.data_is_string[i]) {
+				memcpy(buffer_pointer, ((char*)attr) + 1, rsbuf.attribute_lengths[i]);
+				// todo: proper strcpy for varchar
+				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
+				rsbuf.data_pointers[i][-1] = '\0';
 			} else {
 				memcpy(buffer_pointer, &attr, rsbuf.attribute_lengths[i]);
+				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
 			}
-			rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
 		}
-		/*if (i == 0 || i == 1 || i == 2 || i == 3 || i == 10 || i == 11 || i == 12) {
-			printf("%d, ", *((int*)buffer_pointer));
-		} else if (i == 8 || i == 9 || i == 13 || i == 14) {
-			printf("\"%s\", ", (char*) buffer_pointer);
-		} else if (i == 15) {
-			printf("%s", (char*) buffer_pointer);
-		} else {
-			printf("%lf, ", *((double*) buffer_pointer));
-		}*/
 	}
-	//printf("\n");
-	rsbuf.count++;
 	// check if the buffer is full; if it is, we send it
-	if (rsbuf.count > rsbuf.tuples_per_chunk) {
-		//printf("Packet %zu-%zu.\n", rsbuf.total_tuples_send, rsbuf.total_tuples_send + rsbuf.count);
+	if (rsbuf.count >= rsbuf.tuples_per_chunk || 
+		rsbuf.total_tuples_send + rsbuf.count == 1000000 || /* always transfer on 1M or 10M total tuples: hacky workaround for not knowing when we reach the end */
+		rsbuf.total_tuples_send + rsbuf.count == 10000000) {
 		size_t chunk_data = rsbuf.data_pointers[natts - 1] - rsbuf.buffer + sizeof(size_t);
-		*((size_t*) rsbuf.buffer) = rsbuf.count; // amount of rows to send
+		*((int*) rsbuf.buffer) = (int) rsbuf.count; // amount of rows to send
+		*((int*) (rsbuf.buffer + 4)) = (int) rsbuf.tuples_per_chunk; // amount of rows normally encoded in a chunk
+/*
+		for(int i = 1; i < natts; i++) {
+			printf("%p (%zu); total: %zu\n", rsbuf.data_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i - 1], rsbuf.base_pointers[i] - rsbuf.base_pointers[0]);
+		}
+		printf("Packet %zu-%zu.\nRows: %zu, Length: %zu\n", rsbuf.total_tuples_send, rsbuf.total_tuples_send + rsbuf.count, rsbuf.count, chunk_data);*/
 		for (i = 0; i < natts; ++i) {
-			if (rsbuf.data_is_string[i]) {
-				// set the length of the message in the buffer for string types
-				*((size_t*)(rsbuf.base_pointers[i] - 0x8)) = rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
-			}
 			// reset the base pointer for the next time something is send
 			rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
 		}

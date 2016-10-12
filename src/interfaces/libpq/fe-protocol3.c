@@ -407,7 +407,70 @@ pqParseInput3(PGconn *conn)
 					 */
 					break;
 				case '*':
+				{
+					static int typelengths[] = {4, 4, 4, 4, 8, 8, 8, 8, 2, 2, 4, 4, 4, 26, 11, 45};
 					// FIXME: do something
+					//printf("Message Length: %zu\n", (size_t) msgLength);
+					int rows = (*(int*)(conn->inBuffer + 5));
+					int rows_per_chunk = (*(int*)(conn->inBuffer + 9));
+					//printf("Rows: %d/%d\n", rows, rows_per_chunk);
+					char *basepointers[16];
+					basepointers[0] = conn->inBuffer + 5 + sizeof(size_t);
+					for(int i = 1; i < 16; i++) {
+						if (typelengths[i - 1] < 0) {
+							size_t message_length = *((size_t*)basepointers[i - 1]);
+							//printf("Skipping %zu\n", message_length);
+							basepointers[i] = basepointers[i - 1] + message_length;
+							basepointers[i - 1] += sizeof(size_t);
+						} else {
+							basepointers[i] = basepointers[i - 1] + typelengths[i - 1] * rows_per_chunk;
+						}					
+						//printf("%p (%zu)\n", basepointers[i], basepointers[i] - basepointers[0]);
+					}
+					for(int r = 0; r < rows; r++) {
+						for(int i = 0; i < 16; i++) {
+							char *buffer_pointer = basepointers[i];
+							// print lineitem to verify that the correct results are transferred
+							/*if (i == 0 || i == 1 || i == 2 || i == 3 || i == 10 || i == 11 || i == 12) {
+								printf("%d,", *((int*)buffer_pointer));
+							} else if (i == 8 || i == 9 || i == 13 || i == 14 || i == 15) {
+								static char strbuf[100];
+								memset(strbuf, 0, 100);
+								memcpy(strbuf, buffer_pointer, typelengths[i]);
+								for(int j = 99; j >= 0; j++) {
+									if (strbuf[j] == ' ') {
+										strbuf[j] = '\0';
+									} else if (strbuf[j] != '\0') {
+										break;
+									}
+								}
+								if (i == 15) {
+									printf("%s", strbuf);
+								} else {
+									printf("%s,", strbuf);
+								}
+							} else {
+								printf("%lf,", *((double*) buffer_pointer));
+							}*/
+							basepointers[i] += typelengths[i];
+						}
+						//printf("\n");
+					}
+					//printf("\n");
+
+					conn->inCursor += msgLength;
+				}
+					/*
+					if (conn->result != NULL &&
+						conn->result->resultStatus == PGRES_TUPLES_OK)
+					{
+						size_t length = ((size_t*) conn->inCursor);
+						printf("%zu\n", length);
+						if (pqSkipnchar(sizeof(size_t) + length, conn)) {
+							printf("Failed to skip message.\n");
+							return;
+						}
+					}*/
 					break;
 				default:
 					printfPQExpBuffer(&conn->errorMessage,
