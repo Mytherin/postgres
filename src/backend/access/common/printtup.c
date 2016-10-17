@@ -23,6 +23,7 @@
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 
+#include <snappy-c.h>
 
 static void printtup_startup(DestReceiver *self, int operation,
 				 TupleDesc typeinfo);
@@ -178,6 +179,7 @@ static size_t CHUNK_SIZE = 1000000; // 1 MB chunks
 typedef struct  {
 	size_t maxsize;
 	char *buffer;
+	char *copybuffer;
 	char *compression_buffer;
 	char **bitmask_pointers;
 	char **base_pointers;
@@ -193,6 +195,8 @@ typedef struct  {
 
 static bool initialized = false;
 static ResultSetBuffer rsbuf;
+
+static int USE_COMPRESSION = true;
 
 //#define ROWWISE_COPY
 #define PROTOCOL_NULLMASK
@@ -226,7 +230,8 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	if (!initialized) {
 		rsbuf.maxsize = CHUNK_SIZE;
 		rsbuf.buffer = malloc(CHUNK_SIZE);
-		rsbuf.compression_buffer = malloc(CHUNK_SIZE); // FIXME: max compression size
+		rsbuf.copybuffer = malloc(CHUNK_SIZE);
+		rsbuf.compression_buffer = malloc(snappy_max_compressed_length(CHUNK_SIZE));
 		initialized = true;
 	} else {
 #ifdef PROTOCOL_NULLMASK
@@ -299,9 +304,12 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		baseptr += rsbuf.tuples_per_chunk * rsbuf.attribute_lengths[i] + sizeof(int);
 	}
 
+	USE_COMPRESSION = getenv("POSTGRES_COMPRESSION") != NULL;
 	// send a different row descriptor; because it is easier than extending the current one
 	// for benchmarking purposes
 	pq_beginmessage(&buf, '{'); /* tuple descriptor message type */
+	pq_sendint(&buf, USE_COMPRESSION, 4); /* whether or not we are using compression */
+	pq_sendint(&buf, CHUNK_SIZE, 4); /* whether or not we are using compression */
 	pq_sendint(&buf, natts, 4); /* # of attrs in tuples */
 	pq_sendint(&buf, (int) bitmask_size, 4); /* bitmask size per column in bytes */
 	for (i = 0; i < natts; ++i) {
@@ -310,6 +318,7 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		if (rsbuf.data_is_string[i]) {
 			type = 1;
 		}
+		// FIXME: floating point values not handled correctly here (they should be type = 3)
 		pq_sendint(&buf, type, 4); // type of the tuple (for printing purposes only)
 	}
 	pq_endmessage(&buf);
@@ -480,7 +489,6 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 #endif
 
 		size_t chunk_data = sizeof(int) * 2;
-		pq_putbytes("*", 1);
 		for (i = 0; i < natts; ++i) {
 			if (i > 0) {
 				if (!(rsbuf.data_pointers[i - 1] <= rsbuf.bitmask_pointers[i])) {
@@ -488,30 +496,57 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 				}
 			}
 #ifdef PROTOCOL_NULLMASK
-			for (int j = 0; j < nullmask_size; ++j) {
-				if (rsbuf.bitmask_pointers[i][j] != 0) {
-					printf("Null in bitmask (%d,%d, %d)\n", i, j, (int) rsbuf.bitmask_pointers[i][j]);
-				}
-			}
 			chunk_data += rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i];
 #else
 			chunk_data += rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
 #endif
 			(*(int*) (rsbuf.base_pointers[i])) = (int) (rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
 		}
-		uint32		n32;
-		n32 = htonl((uint32) (chunk_data + 4));
-		pq_putbytes((char *) &n32, 4);
-		pq_putbytes(&rsbuf.count, 4);
-		pq_putbytes(&nullmask_size, 4);
-		for (i = 0; i < natts; ++i) {
+		pq_putbytes("*", 1);
+		if (USE_COMPRESSION) {
+			// use snappy to compress the data first
+			char *buffer = rsbuf.copybuffer;
+			memcpy(buffer, &rsbuf.count, 4);
+			buffer += 4;
+			memcpy(buffer,&nullmask_size, 4);
+			buffer += 4;
+			for (i = 0; i < natts; ++i) {
 #ifdef PROTOCOL_NULLMASK
-			pq_putbytes(rsbuf.bitmask_pointers[i], rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i]);
+				memcpy(buffer, rsbuf.bitmask_pointers[i], rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i]);
+				buffer += rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i];
 #else
-			pq_putbytes(rsbuf.base_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
+				memcpy(buffer, rsbuf.base_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
+				buffer += rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
 #endif		
+			}
+			size_t compressed_length;
+			if (snappy_compress(rsbuf.copybuffer, buffer - rsbuf.copybuffer, rsbuf.compression_buffer, &compressed_length) != SNAPPY_OK) {
+				printf("Failed to compress data.\n");
+			} else {
+				printf("Succeeded in compressing {%zu -> %zu}.\n", buffer - rsbuf.copybuffer, compressed_length);
+			}
+			uint32		n32;
+			n32 = htonl((uint32) (compressed_length + 4));
+			pq_putbytes((char *) &n32, 4);
+			pq_putbytes(rsbuf.compression_buffer, compressed_length);
+		} else {
+			// no compression, directly write bytes to the underlying buffer
+			uint32		n32;
+			n32 = htonl((uint32) (chunk_data + 4));
+			pq_putbytes((char *) &n32, 4);
+			pq_putbytes(&rsbuf.count, 4);
+			pq_putbytes(&nullmask_size, 4);
+			for (i = 0; i < natts; ++i) {
+#ifdef PROTOCOL_NULLMASK
+				pq_putbytes(rsbuf.bitmask_pointers[i], rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i]);
+#else
+				pq_putbytes(rsbuf.base_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
+#endif		
+			}
 		}
 /*
+
+		}
 		for(int i = 1; i < natts; i++) {
 			printf("%p (%zu); total: %zu\n", rsbuf.data_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i - 1], rsbuf.base_pointers[i] - rsbuf.base_pointers[0]);
 		}

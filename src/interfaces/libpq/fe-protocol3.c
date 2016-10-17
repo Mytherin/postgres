@@ -33,6 +33,7 @@
 #include <arpa/inet.h>
 #endif
 
+#include <snappy-c.h>
 
 /*
  * This macro lists the backend message types that could be "long" (more
@@ -62,9 +63,12 @@ typedef struct  {
 	int *typelengths;
 	int *types;
 	int nullmask_size;
+	char *result_buffer;
 } ResultSetInformation;
 
 static ResultSetInformation rsinfo;
+
+static int USE_COMPRESSION = false;
 
 #define eightalign(sz) ((sz + 7) & ~7)
 
@@ -421,6 +425,10 @@ pqParseInput3(PGconn *conn)
 					break;
 				case '{': {
 					char *buffer = conn->inBuffer + 5;
+					USE_COMPRESSION = ntohl(*((int*) buffer));
+					buffer += 4;
+					int chunk_size = ntohl(*((int*) buffer));
+					buffer += 4;
 					rsinfo.natts = ntohl(*((int*) buffer));
 					buffer += 4;
 					rsinfo.nullmask_size = ntohl(*((int*) buffer));
@@ -433,17 +441,31 @@ pqParseInput3(PGconn *conn)
 						rsinfo.types[i] = ntohl(*((int*) buffer));
 						buffer += 4;
 					}
+					if (USE_COMPRESSION) {
+						rsinfo.result_buffer = malloc(chunk_size);
+					}
 					break;
 				}
 				case '*':
 				{
-					int rows = (*(int*)(conn->inBuffer + 5));
-					int nullmask_size = (*(int*)(conn->inBuffer + 9));
+					char *result_buffer;
+					if (USE_COMPRESSION) {
+						int message_length = ntohl(*(int*)(conn->inBuffer + 1)) - 4;
+						size_t uncompressed_length;
+						if (snappy_uncompress(conn->inBuffer + 5, message_length, rsinfo.result_buffer, &uncompressed_length) != SNAPPY_OK) {
+							printf("Failed to decompress.\n");
+						}
+						result_buffer = rsinfo.result_buffer;
+					} else {
+						result_buffer = conn->inBuffer + 5;
+					}
+					int rows = (*(int*)(result_buffer));
+					int nullmask_size = (*(int*)(result_buffer + 4));
 					//printf("Rows: %d/%d\n", rows, rows_per_chunk);
 					char **basepointers = malloc(sizeof(char*) * rsinfo.natts);
 					char **nullmaskpointers = malloc(sizeof(char*) * rsinfo.natts);
 					int nullmask_byte = 0, nullmask_bit = 0;
-					nullmaskpointers[0] = conn->inBuffer + 13;
+					nullmaskpointers[0] = result_buffer + 8;
 					basepointers[0] = nullmaskpointers[0] + nullmask_size;
 					for(int i = 1; i < rsinfo.natts; i++) {
 						nullmaskpointers[i] = basepointers[i - 1] + *((int*)(basepointers[i - 1]));
@@ -465,6 +487,7 @@ pqParseInput3(PGconn *conn)
 								// NULL value
 								printf("NULL,");
 							} else {
+								// FIXME: Date printing
 								if (rsinfo.types[i] == 1) { // STRING
 									printf("%s,", (char*) buffer_pointer);
 								} else if (rsinfo.types[i] == 2) { // integer
