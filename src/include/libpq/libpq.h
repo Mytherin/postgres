@@ -32,6 +32,7 @@ typedef struct
 	void		(*putmessage_noblock) (char msgtype, const char *s, size_t len);
 	void		(*startcopyout) (void);
 	void		(*endcopyout) (bool errorAbort);
+	int         (*writemessage) (char msgtype, size_t msgsize, char *bufptr, char *bufend);
 } PQcommMethods;
 
 extern PGDLLIMPORT PQcommMethods *PqCommMethods;
@@ -46,6 +47,8 @@ extern PGDLLIMPORT PQcommMethods *PqCommMethods;
 	(PqCommMethods->putmessage_noblock(msgtype, s, len))
 #define pq_startcopyout() (PqCommMethods->startcopyout())
 #define pq_endcopyout(errorAbort) (PqCommMethods->endcopyout(errorAbort))
+#define pq_writemessage(msgtype,msgsize,bufstart,bufend) \
+	(PqCommMethods->writemessage(msgtype,msgsize,bufstart,bufend))
 
 /*
  * External functions.

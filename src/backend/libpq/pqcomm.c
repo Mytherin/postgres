@@ -143,8 +143,10 @@ static int	socket_putmessage(char msgtype, const char *s, size_t len);
 static void socket_putmessage_noblock(char msgtype, const char *s, size_t len);
 static void socket_startcopyout(void);
 static void socket_endcopyout(bool errorAbort);
+static int  socket_writemessage(char msgtype, size_t msgsize, char *bufptr, char *bufend);
 static int	internal_putbytes(const char *s, size_t len);
 static int	internal_flush(void);
+
 
 #ifdef HAVE_UNIX_SOCKETS
 static int	Lock_AF_UNIX(char *unixSocketDir, char *unixSocketPath);
@@ -159,7 +161,8 @@ static PQcommMethods PqCommSocketMethods = {
 	socket_putmessage,
 	socket_putmessage_noblock,
 	socket_startcopyout,
-	socket_endcopyout
+	socket_endcopyout,
+	socket_writemessage
 };
 
 PQcommMethods *PqCommMethods = &PqCommSocketMethods;
@@ -1311,8 +1314,6 @@ pq_putbytes(const char *s, size_t len)
 {
 	int			res;
 
-	/* Should only be called by old-style COPY OUT */
-	Assert(DoingCopyOut);
 	/* No-op if reentrant call */
 	if (PqCommBusy)
 		return 0;
@@ -1565,6 +1566,50 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 	res = pq_putmessage(msgtype, s, len);
 	Assert(res == 0);			/* should not fail when the message fits in
 								 * buffer */
+}
+
+
+// ugly wrapper around internal_flush that sends a custom buffer over the stream 
+static int
+socket_writemessage(char msgtype, size_t msgsize, char *bufptr, char *bufend) {
+	if (DoingCopyOut || PqCommBusy)
+		return 0;
+	PqCommBusy = true;
+
+	internal_flush();
+	
+	memcpy(bufptr, &msgtype, 1);
+	uint32		n32;
+	n32 = htonl((uint32) (msgsize + 4));
+	memcpy(bufptr + 1, &n32, 4);
+
+	char *tmpbuf = PqSendBuffer;
+	int tmpbufsiz = PqSendBufferSize;
+	int tmpsendstart = PqSendStart;
+	int tmpsendpointer = PqSendPointer;
+
+	PqSendBuffer = bufptr;
+	PqSendBufferSize = -1;
+	PqSendStart = 0;
+	PqSendPointer = bufend - bufptr;
+
+	if (internal_flush() != 0) {
+		PqSendBuffer = tmpbuf;
+		PqSendBufferSize = tmpbufsiz;
+		PqSendStart = tmpsendstart;
+		PqSendPointer = tmpsendpointer;
+		PqCommBusy = false;
+		fprintf(stderr, "Failed to flush.\n");
+		return 1;
+	}
+	fprintf(stdout, "Successful flush of %zu bytes.\n", msgsize);
+
+	PqSendBuffer = tmpbuf;
+	PqSendBufferSize = tmpbufsiz;
+	PqSendStart = tmpsendstart;
+	PqSendPointer = tmpsendpointer;
+	PqCommBusy = false;
+	return 0;
 }
 
 

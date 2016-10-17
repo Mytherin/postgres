@@ -410,7 +410,6 @@ pqParseInput3(PGconn *conn)
 				{
 					static int typelengths[] = {4, 4, 4, 4, 8, 8, 8, 8, 2, 2, 4, 4, 4, 26, 11, 45};
 					// FIXME: do something
-					//printf("Message Length: %zu\n", (size_t) msgLength);
 					int rows = (*(int*)(conn->inBuffer + 5));
 					int rows_per_chunk = (*(int*)(conn->inBuffer + 9));
 					//printf("Rows: %d/%d\n", rows, rows_per_chunk);

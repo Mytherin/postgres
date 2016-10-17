@@ -194,6 +194,9 @@ typedef struct  {
 static bool initialized = false;
 static ResultSetBuffer rsbuf;
 
+//#define ROWWISE_COPY
+#define PROTOCOL_NULLMASK
+
 // align number to nearest multiple of eight (e.g. eightalign(15) = 16, eightalign(8) = 8, eightalign(9) = 16)
 #define eightalign(sz) ((sz + 7) & ~7)
 
@@ -226,7 +229,9 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		rsbuf.compression_buffer = malloc(CHUNK_SIZE); // FIXME: max compression size
 		initialized = true;
 	} else {
+#ifdef PROTOCOL_NULLMASK
 		free(rsbuf.bitmask_pointers);
+#endif
 		free(rsbuf.base_pointers);
 		free(rsbuf.data_pointers);
 		free(rsbuf.data_is_string);
@@ -237,14 +242,20 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	rsbuf.total_tuples_send = 0;
 	rsbuf.total_tuples = 0; // FIXME
 	rsbuf.count = 0;
+#ifdef PROTOCOL_NULLMASK
 	rsbuf.bitmask_pointers = malloc(sizeof(char*) * natts);
+#endif
 	rsbuf.base_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_is_string = malloc(sizeof(bool) * natts);
 	rsbuf.attribute_lengths = malloc(sizeof(size_t) * natts);
 
 	// rowsize in bits
+#ifdef PROTOCOL_NULLMASK
 	rowsize = natts; // reserve one bit per attribute for the null mask
+#else
+	rowsize = 0;
+#endif
 	for (i = 0; i < natts; ++i) {
 		char category;
 		bool preferred;
@@ -260,16 +271,25 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		rowsize += attribute_length * 8; //attribute length is given in 
 		Assert(attribute_length > 0); // FIXME: deal with Blobs
 	}
+#ifdef PROTOCOL_NULLMASK
 	// only consider chunks of eight rows for easy bitmask alignment
+	rsbuf.tuples_per_chunk = eightalign((8 * 8 * (CHUNK_SIZE - sizeof(size_t) - 1)) / (8 * rowsize)) - 8;
+#else
 	rsbuf.tuples_per_chunk = (8 * 8 * (CHUNK_SIZE - sizeof(size_t) - 1)) / (8 * rowsize);
+#endif
 
+#ifdef PROTOCOL_NULLMASK
 	// bitmask size per column in bytes
 	size_t bitmask_size = eightalign(rsbuf.tuples_per_chunk) / 8;
-	baseptr = rsbuf.buffer + sizeof(size_t); // new result set message
+#endif
+
+	baseptr = rsbuf.buffer + sizeof(size_t) + sizeof(int) + sizeof(char); // new result set message
 	for (i = 0; i < natts; ++i) {
+#ifdef PROTOCOL_NULLMASK
 		rsbuf.bitmask_pointers[i] = baseptr;
 		baseptr += bitmask_size;
 		memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with NULL values
+#endif
 
 		rsbuf.base_pointers[i] = baseptr;
 		rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
@@ -378,6 +398,9 @@ printtup_prepare_info(DR_printtup *myState, TupleDesc typeinfo, int numAttrs)
 	}
 }
 
+
+static size_t transmitted_size = 0;
+
 /* ----------------
  *		printtup --- print a tuple in protocol 3.0
  * ----------------
@@ -401,15 +424,27 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 		char *buffer_pointer = rsbuf.data_pointers[i];
 		Datum attr = slot->tts_values[i];
 		if (slot->tts_isnull[i]) {
+#ifdef PROTOCOL_NULLMASK
 			// set bit in null mask
 			size_t byte = rsbuf.count / 8;
 			int bit = rsbuf.count % 8;
 			rsbuf.bitmask_pointers[i][byte] |= 1 << bit;
+#else
+			if (rsbuf.data_is_string[i]) {
+				rsbuf.data_pointers[i][0] = '\0';
+				rsbuf.data_pointers[i][1] = '\0';
+				rsbuf.data_pointers[i] += 2;				
+			} else {
+				memset(rsbuf.data_pointers[i], 1, rsbuf.attribute_lengths[i]);
+				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
+			}
+#endif
 		} else {
 			if (rsbuf.data_is_string[i]) {
-				memcpy(buffer_pointer, ((char*)attr) + 1, rsbuf.attribute_lengths[i]);
+				int len = VARSIZE_ANY_EXHDR(attr);
+				memcpy(buffer_pointer, ((char*)attr) + 1, len);
 				// todo: proper strcpy for varchar
-				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
+				rsbuf.data_pointers[i] += len;
 				rsbuf.data_pointers[i][-1] = '\0';
 			} else {
 				memcpy(buffer_pointer, &attr, rsbuf.attribute_lengths[i]);
@@ -421,9 +456,34 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	if (rsbuf.count >= rsbuf.tuples_per_chunk || 
 		rsbuf.total_tuples_send + rsbuf.count == 1000000 || /* always transfer on 1M or 10M total tuples: hacky workaround for not knowing when we reach the end */
 		rsbuf.total_tuples_send + rsbuf.count == 10000000) {
-		size_t chunk_data = rsbuf.data_pointers[natts - 1] - rsbuf.buffer + sizeof(size_t);
-		*((int*) rsbuf.buffer) = (int) rsbuf.count; // amount of rows to send
-		*((int*) (rsbuf.buffer + 4)) = (int) rsbuf.tuples_per_chunk; // amount of rows normally encoded in a chunk
+		*((int*) (rsbuf.buffer + 5)) = (int) rsbuf.count; // amount of rows to send
+		*((int*) (rsbuf.buffer + 9)) = (int) rsbuf.tuples_per_chunk; // amount of rows normally encoded in a chunk
+
+
+		size_t chunk_data = sizeof(int) * 2;
+		pq_putbytes("*", 1);
+		for (i = 0; i < natts; ++i) {
+#ifdef PROTOCOL_NULLMASK
+			chunk_data += rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i];
+#else
+			chunk_data += rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
+#endif
+		}
+		uint32		n32;
+		n32 = htonl((uint32) (chunk_data + 4));
+		pq_putbytes((char *) &n32, 4);
+		pq_putbytes(&rsbuf.count, 4);
+		pq_putbytes(&rsbuf.tuples_per_chunk, 4);
+		for (i = 0; i < natts; ++i) {
+#ifdef PROTOCOL_NULLMASK
+			pq_putbytes(rsbuf.bitmask_pointers[i], rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i]);
+#else
+			pq_putbytes(rsbuf.base_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
+#endif		
+		}
+
+
+
 /*
 		for(int i = 1; i < natts; i++) {
 			printf("%p (%zu); total: %zu\n", rsbuf.data_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i - 1], rsbuf.base_pointers[i] - rsbuf.base_pointers[0]);
@@ -433,13 +493,18 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			// reset the base pointer for the next time something is send
 			rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
 		}
-		// actually send the message to the client
-		pq_putmessage('*', rsbuf.buffer, chunk_data);
+
+		// // actually send the message to the client
+		// //pq_putmessage_noblock('*', rsbuf.buffer + 5, chunk_data);
+		// if (pq_writemessage('*', chunk_data, rsbuf.buffer, rsbuf.data_pointers[natts - 1]) != 0) {
+		// 	return false;
+		// }
 		rsbuf.total_tuples_send += rsbuf.count;
 		rsbuf.count = 0;
+		transmitted_size += chunk_data;
 	}
-	return true;
 
+	return true;
 
 	/* Set or update my derived attribute info, if needed */
 	if (myState->attrinfo != typeinfo || myState->nattrs != natts)
