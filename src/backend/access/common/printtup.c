@@ -256,6 +256,8 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 #else
 	rowsize = 0;
 #endif
+
+	size_t bytes_left = CHUNK_SIZE - sizeof(int) * natts  - sizeof(size_t) - 1;
 	for (i = 0; i < natts; ++i) {
 		char category;
 		bool preferred;
@@ -268,14 +270,14 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 			attribute_length = 4; // dates are stored as 4-byte integers
 		}
 		rsbuf.attribute_lengths[i] = attribute_length;
-		rowsize += attribute_length * 8; //attribute length is given in 
+		rowsize += attribute_length * 8; //attribute length is given in bytes; convert to bits
 		Assert(attribute_length > 0); // FIXME: deal with Blobs
 	}
 #ifdef PROTOCOL_NULLMASK
 	// only consider chunks of eight rows for easy bitmask alignment
-	rsbuf.tuples_per_chunk = eightalign((8 * 8 * (CHUNK_SIZE - sizeof(size_t) - 1)) / (8 * rowsize)) - 8;
+	rsbuf.tuples_per_chunk = eightalign((8 * 8 * (bytes_left)) / (8 * rowsize)) - 8;
 #else
-	rsbuf.tuples_per_chunk = (8 * 8 * (CHUNK_SIZE - sizeof(size_t) - 1)) / (8 * rowsize);
+	rsbuf.tuples_per_chunk = (8 * 8 * (bytes_left)) / (8 * rowsize);
 #endif
 
 #ifdef PROTOCOL_NULLMASK
@@ -287,15 +289,31 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	for (i = 0; i < natts; ++i) {
 #ifdef PROTOCOL_NULLMASK
 		rsbuf.bitmask_pointers[i] = baseptr;
+		memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with 0 values
 		baseptr += bitmask_size;
-		memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with NULL values
 #endif
 
 		rsbuf.base_pointers[i] = baseptr;
-		rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
+		rsbuf.data_pointers[i] = rsbuf.base_pointers[i] + sizeof(int);
 
-		baseptr += rsbuf.tuples_per_chunk * rsbuf.attribute_lengths[i];
+		baseptr += rsbuf.tuples_per_chunk * rsbuf.attribute_lengths[i] + sizeof(int);
 	}
+
+	// send a different row descriptor; because it is easier than extending the current one
+	// for benchmarking purposes
+	pq_beginmessage(&buf, '{'); /* tuple descriptor message type */
+	pq_sendint(&buf, natts, 4); /* # of attrs in tuples */
+	pq_sendint(&buf, (int) bitmask_size, 4); /* bitmask size per column in bytes */
+	for (i = 0; i < natts; ++i) {
+		int type = 2;
+		pq_sendint(&buf, rsbuf.attribute_lengths[i], 4); // attribute length of this tuple
+		if (rsbuf.data_is_string[i]) {
+			type = 1;
+		}
+		pq_sendint(&buf, type, 4); // type of the tuple (for printing purposes only)
+	}
+	pq_endmessage(&buf);
+
 
 	Assert(rsbuf.tuples_per_chunk > 0);
 
@@ -421,7 +439,6 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	rsbuf.count++;
 	// copy the data of this row into the buffer
 	for (i = 0; i < natts; ++i) {
-		char *buffer_pointer = rsbuf.data_pointers[i];
 		Datum attr = slot->tts_values[i];
 		if (slot->tts_isnull[i]) {
 #ifdef PROTOCOL_NULLMASK
@@ -431,7 +448,8 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			rsbuf.bitmask_pointers[i][byte] |= 1 << bit;
 #else
 			if (rsbuf.data_is_string[i]) {
-				rsbuf.data_pointers[i][0] = '\0';
+				// NULL value is an illegal UTF-8 bit
+				rsbuf.data_pointers[i][0] = '\200';
 				rsbuf.data_pointers[i][1] = '\0';
 				rsbuf.data_pointers[i] += 2;				
 			} else {
@@ -442,12 +460,11 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 		} else {
 			if (rsbuf.data_is_string[i]) {
 				int len = VARSIZE_ANY_EXHDR(attr);
-				memcpy(buffer_pointer, ((char*)attr) + 1, len);
-				// todo: proper strcpy for varchar
-				rsbuf.data_pointers[i] += len;
-				rsbuf.data_pointers[i][-1] = '\0';
+				memcpy(rsbuf.data_pointers[i], ((char*)attr) + 1, len);
+				rsbuf.data_pointers[i][len] = '\0';
+				rsbuf.data_pointers[i] += len + 1;
 			} else {
-				memcpy(buffer_pointer, &attr, rsbuf.attribute_lengths[i]);
+				memcpy(rsbuf.data_pointers[i], &attr, rsbuf.attribute_lengths[i]);
 				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
 			}
 		}
@@ -456,24 +473,37 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	if (rsbuf.count >= rsbuf.tuples_per_chunk || 
 		rsbuf.total_tuples_send + rsbuf.count == 1000000 || /* always transfer on 1M or 10M total tuples: hacky workaround for not knowing when we reach the end */
 		rsbuf.total_tuples_send + rsbuf.count == 10000000) {
+		int nullmask_size = 0;
 		*((int*) (rsbuf.buffer + 5)) = (int) rsbuf.count; // amount of rows to send
-		*((int*) (rsbuf.buffer + 9)) = (int) rsbuf.tuples_per_chunk; // amount of rows normally encoded in a chunk
-
+#ifdef PROTOCOL_NULLMASK
+		nullmask_size = (int) (rsbuf.base_pointers[0] - rsbuf.bitmask_pointers[0]); // amount of rows normally encoded in a chunk
+#endif
 
 		size_t chunk_data = sizeof(int) * 2;
 		pq_putbytes("*", 1);
 		for (i = 0; i < natts; ++i) {
+			if (i > 0) {
+				if (!(rsbuf.data_pointers[i - 1] <= rsbuf.bitmask_pointers[i])) {
+					printf("Out of buffer exception (%zu)\n", rsbuf.data_pointers[i - 1] - rsbuf.bitmask_pointers[i]);
+				}
+			}
 #ifdef PROTOCOL_NULLMASK
+			for (int j = 0; j < nullmask_size; ++j) {
+				if (rsbuf.bitmask_pointers[i][j] != 0) {
+					printf("Null in bitmask (%d,%d, %d)\n", i, j, (int) rsbuf.bitmask_pointers[i][j]);
+				}
+			}
 			chunk_data += rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i];
 #else
 			chunk_data += rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
 #endif
+			(*(int*) (rsbuf.base_pointers[i])) = (int) (rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
 		}
 		uint32		n32;
 		n32 = htonl((uint32) (chunk_data + 4));
 		pq_putbytes((char *) &n32, 4);
 		pq_putbytes(&rsbuf.count, 4);
-		pq_putbytes(&rsbuf.tuples_per_chunk, 4);
+		pq_putbytes(&nullmask_size, 4);
 		for (i = 0; i < natts; ++i) {
 #ifdef PROTOCOL_NULLMASK
 			pq_putbytes(rsbuf.bitmask_pointers[i], rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i]);
@@ -481,9 +511,6 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			pq_putbytes(rsbuf.base_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
 #endif		
 		}
-
-
-
 /*
 		for(int i = 1; i < natts; i++) {
 			printf("%p (%zu); total: %zu\n", rsbuf.data_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i - 1], rsbuf.base_pointers[i] - rsbuf.base_pointers[0]);
@@ -491,7 +518,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 		printf("Packet %zu-%zu.\nRows: %zu, Length: %zu\n", rsbuf.total_tuples_send, rsbuf.total_tuples_send + rsbuf.count, rsbuf.count, chunk_data);*/
 		for (i = 0; i < natts; ++i) {
 			// reset the base pointer for the next time something is send
-			rsbuf.data_pointers[i] = rsbuf.base_pointers[i];
+			rsbuf.data_pointers[i] = rsbuf.base_pointers[i] + sizeof(int);
 		}
 
 		// // actually send the message to the client

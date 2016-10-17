@@ -57,6 +57,19 @@ static int build_startup_packet(const PGconn *conn, char *packet,
 					 const PQEnvironmentOption *options);
 
 
+typedef struct  {
+	int natts;
+	int *typelengths;
+	int *types;
+	int nullmask_size;
+} ResultSetInformation;
+
+static ResultSetInformation rsinfo;
+
+#define eightalign(sz) ((sz + 7) & ~7)
+
+//#define PRINT_OUTPUT
+
 /*
  * parseInput: if appropriate, parse input data from backend
  * until input is exhausted or a stopping state is reached.
@@ -406,56 +419,97 @@ pqParseInput3(PGconn *conn)
 					 * the COPY command.
 					 */
 					break;
+				case '{': {
+					char *buffer = conn->inBuffer + 5;
+					rsinfo.natts = ntohl(*((int*) buffer));
+					buffer += 4;
+					rsinfo.nullmask_size = ntohl(*((int*) buffer));
+					buffer += 4;
+					rsinfo.typelengths = malloc(rsinfo.natts * sizeof(int));
+					rsinfo.types = malloc(rsinfo.natts * sizeof(int));
+					for(int i = 0; i < rsinfo.natts; i++) {
+						rsinfo.typelengths[i] = ntohl(*((int*) buffer));
+						buffer += 4;
+						rsinfo.types[i] = ntohl(*((int*) buffer));
+						buffer += 4;
+					}
+					break;
+				}
 				case '*':
 				{
-					static int typelengths[] = {4, 4, 4, 4, 8, 8, 8, 8, 2, 2, 4, 4, 4, 26, 11, 45};
-					// FIXME: do something
 					int rows = (*(int*)(conn->inBuffer + 5));
-					int rows_per_chunk = (*(int*)(conn->inBuffer + 9));
+					int nullmask_size = (*(int*)(conn->inBuffer + 9));
 					//printf("Rows: %d/%d\n", rows, rows_per_chunk);
-					char *basepointers[16];
-					basepointers[0] = conn->inBuffer + 5 + sizeof(size_t);
-					for(int i = 1; i < 16; i++) {
-						if (typelengths[i - 1] < 0) {
-							size_t message_length = *((size_t*)basepointers[i - 1]);
-							//printf("Skipping %zu\n", message_length);
-							basepointers[i] = basepointers[i - 1] + message_length;
-							basepointers[i - 1] += sizeof(size_t);
-						} else {
-							basepointers[i] = basepointers[i - 1] + typelengths[i - 1] * rows_per_chunk;
-						}					
-						//printf("%p (%zu)\n", basepointers[i], basepointers[i] - basepointers[0]);
+					char **basepointers = malloc(sizeof(char*) * rsinfo.natts);
+					char **nullmaskpointers = malloc(sizeof(char*) * rsinfo.natts);
+					int nullmask_byte = 0, nullmask_bit = 0;
+					nullmaskpointers[0] = conn->inBuffer + 13;
+					basepointers[0] = nullmaskpointers[0] + nullmask_size;
+					for(int i = 1; i < rsinfo.natts; i++) {
+						nullmaskpointers[i] = basepointers[i - 1] + *((int*)(basepointers[i - 1]));
+						basepointers[i] = nullmaskpointers[i] + nullmask_size;
+						basepointers[i - 1] += sizeof(int);
 					}
+					basepointers[rsinfo.natts - 1] += sizeof(int);
 					for(int r = 0; r < rows; r++) {
-						for(int i = 0; i < 16; i++) {
+						nullmask_bit++;
+						if (nullmask_bit == 8) {
+							nullmask_bit = 0;
+							nullmask_byte++;
+						}
+						for(int i = 0; i < rsinfo.natts; i++) {
 							char *buffer_pointer = basepointers[i];
-							// print lineitem to verify that the correct results are transferred
-							/*if (i == 0 || i == 1 || i == 2 || i == 3 || i == 10 || i == 11 || i == 12) {
-								printf("%d,", *((int*)buffer_pointer));
-							} else if (i == 8 || i == 9 || i == 13 || i == 14 || i == 15) {
-								static char strbuf[100];
-								memset(strbuf, 0, 100);
-								memcpy(strbuf, buffer_pointer, typelengths[i]);
-								for(int j = 99; j >= 0; j++) {
-									if (strbuf[j] == ' ') {
-										strbuf[j] = '\0';
-									} else if (strbuf[j] != '\0') {
-										break;
+							// printing code, just for debug purposes to check if the data we send over is correct
+#ifdef PRINT_OUTPUT
+							if (nullmaskpointers[i][nullmask_byte] & (1 << nullmask_bit)) {
+								// NULL value
+								printf("NULL,");
+							} else {
+								if (rsinfo.types[i] == 1) { // STRING
+									printf("%s,", (char*) buffer_pointer);
+								} else if (rsinfo.types[i] == 2) { // integer
+									if (rsinfo.typelengths[i] == 1) {
+										printf("%d,",  (int) *((char*) buffer_pointer));
+									} else if (rsinfo.typelengths[i] == 2) {
+										printf("%d,", (int) *((short*) buffer_pointer));
+									} else if (rsinfo.typelengths[i] == 4) {
+										printf("%d,", *((int*) buffer_pointer));
+									} else if (rsinfo.typelengths[i] == 8) {
+										printf("%lld,", *((long long*) buffer_pointer));
+									} else {
+										// invalid type length for integer
+										Assert(0);
+									}
+								} else if (rsinfo.types[i] == 3) { // floating point
+									if (rsinfo.typelengths[i] == 4) {
+										printf("%f,", *((float*) buffer_pointer));
+									} else if (rsinfo.typelengths[i] == 8) {
+										printf("%lf,", *((double*) buffer_pointer));
+									} else {
+										// invalid type length for floating point
+										Assert(0);
 									}
 								}
-								if (i == 15) {
-									printf("%s", strbuf);
+							}
+#endif
+
+							if (!(nullmaskpointers[i][nullmask_byte] & (1 << nullmask_bit))) {
+								// not a null value; advance the pointer
+								if (rsinfo.types[i] == 1) { // STRING, so we have to scan for the null byte
+									basepointers[i] += strlen(basepointers[i]) + 1;
 								} else {
-									printf("%s,", strbuf);
+									// we know the length of the type, so just increment the pointer
+									basepointers[i] += rsinfo.typelengths[i];
 								}
-							} else {
-								printf("%lf,", *((double*) buffer_pointer));
-							}*/
-							basepointers[i] += typelengths[i];
+							}
 						}
-						//printf("\n");
+#ifdef PRINT_OUTPUT
+						printf("\n");
+#endif
 					}
-					//printf("\n");
+#ifdef PRINT_OUTPUT
+					printf("\n");
+#endif
 
 					conn->inCursor += msgLength;
 				}
