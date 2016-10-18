@@ -197,6 +197,7 @@ static bool initialized = false;
 static ResultSetBuffer rsbuf;
 
 static int USE_COMPRESSION = true;
+static int MAX_COMPRESSED_LENGTH = 1000000;
 
 //#define ROWWISE_COPY
 #define PROTOCOL_NULLMASK
@@ -231,8 +232,15 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		rsbuf.maxsize = CHUNK_SIZE;
 		rsbuf.buffer = malloc(CHUNK_SIZE);
 		rsbuf.copybuffer = malloc(CHUNK_SIZE);
-		rsbuf.compression_buffer = malloc(snappy_max_compressed_length(CHUNK_SIZE));
+		MAX_COMPRESSED_LENGTH = snappy_max_compressed_length(CHUNK_SIZE);
+		rsbuf.compression_buffer = malloc(MAX_COMPRESSED_LENGTH);
 		initialized = true;
+		USE_COMPRESSION = getenv("POSTGRES_COMPRESSION") != NULL;
+		if (USE_COMPRESSION) {
+			pq_enlargebuffer(MAX_COMPRESSED_LENGTH);
+		} else {
+			pq_enlargebuffer(CHUNK_SIZE);
+		}
 	} else {
 #ifdef PROTOCOL_NULLMASK
 		free(rsbuf.bitmask_pointers);
@@ -304,7 +312,6 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		baseptr += rsbuf.tuples_per_chunk * rsbuf.attribute_lengths[i] + sizeof(int);
 	}
 
-	USE_COMPRESSION = getenv("POSTGRES_COMPRESSION") != NULL;
 	// send a different row descriptor; because it is easier than extending the current one
 	// for benchmarking purposes
 	pq_beginmessage(&buf, '{'); /* tuple descriptor message type */
@@ -502,7 +509,6 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 #endif
 			(*(int*) (rsbuf.base_pointers[i])) = (int) (rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
 		}
-		pq_putbytes("*", 1);
 		if (USE_COMPRESSION) {
 			// use snappy to compress the data first
 			char *buffer = rsbuf.copybuffer;
@@ -519,7 +525,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 				buffer += rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
 #endif		
 			}
-			size_t compressed_length;
+			size_t compressed_length = MAX_COMPRESSED_LENGTH;
 			if (snappy_compress(rsbuf.copybuffer, buffer - rsbuf.copybuffer, rsbuf.compression_buffer, &compressed_length) != SNAPPY_OK) {
 				printf("Failed to compress data.\n");
 			} else {
@@ -527,12 +533,16 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			}
 			uint32		n32;
 			n32 = htonl((uint32) (compressed_length + 4));
+			pq_flush();
+			pq_putbytes("*", 1);
 			pq_putbytes((char *) &n32, 4);
 			pq_putbytes(rsbuf.compression_buffer, compressed_length);
 		} else {
 			// no compression, directly write bytes to the underlying buffer
 			uint32		n32;
 			n32 = htonl((uint32) (chunk_data + 4));
+			pq_flush();
+			pq_putbytes("*", 1);
 			pq_putbytes((char *) &n32, 4);
 			pq_putbytes(&rsbuf.count, 4);
 			pq_putbytes(&nullmask_size, 4);

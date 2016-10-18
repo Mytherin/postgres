@@ -144,9 +144,9 @@ static void socket_putmessage_noblock(char msgtype, const char *s, size_t len);
 static void socket_startcopyout(void);
 static void socket_endcopyout(bool errorAbort);
 static int  socket_writemessage(char msgtype, size_t msgsize, char *bufptr, char *bufend);
+static void socket_enlarge_buffer(size_t len);
 static int	internal_putbytes(const char *s, size_t len);
 static int	internal_flush(void);
-
 
 #ifdef HAVE_UNIX_SOCKETS
 static int	Lock_AF_UNIX(char *unixSocketDir, char *unixSocketPath);
@@ -162,7 +162,8 @@ static PQcommMethods PqCommSocketMethods = {
 	socket_putmessage_noblock,
 	socket_startcopyout,
 	socket_endcopyout,
-	socket_writemessage
+	socket_writemessage,
+	socket_enlarge_buffer
 };
 
 PQcommMethods *PqCommMethods = &PqCommSocketMethods;
@@ -1568,6 +1569,16 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 								 * buffer */
 }
 
+static void 
+socket_enlarge_buffer(size_t len) {
+	int required = PqSendPointer + 1 + 4 + len;
+	if (required > PqSendBufferSize)
+	{
+		PqSendBuffer = repalloc(PqSendBuffer, required);
+		PqSendBufferSize = required;
+	}
+}
+
 
 // ugly wrapper around internal_flush that sends a custom buffer over the stream 
 static int
@@ -1578,9 +1589,11 @@ socket_writemessage(char msgtype, size_t msgsize, char *bufptr, char *bufend) {
 
 	internal_flush();
 	
+	msgsize = bufend - (bufptr + 1);
+
 	memcpy(bufptr, &msgtype, 1);
 	uint32		n32;
-	n32 = htonl((uint32) (msgsize + 4));
+	n32 = htonl((uint32) msgsize);
 	memcpy(bufptr + 1, &n32, 4);
 
 	char *tmpbuf = PqSendBuffer;

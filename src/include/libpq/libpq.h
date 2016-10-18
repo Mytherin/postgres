@@ -33,6 +33,7 @@ typedef struct
 	void		(*startcopyout) (void);
 	void		(*endcopyout) (bool errorAbort);
 	int         (*writemessage) (char msgtype, size_t msgsize, char *bufptr, char *bufend);
+	void        (*enlargebuffer) (size_t newsize);
 } PQcommMethods;
 
 extern PGDLLIMPORT PQcommMethods *PqCommMethods;
@@ -49,6 +50,8 @@ extern PGDLLIMPORT PQcommMethods *PqCommMethods;
 #define pq_endcopyout(errorAbort) (PqCommMethods->endcopyout(errorAbort))
 #define pq_writemessage(msgtype,msgsize,bufstart,bufend) \
 	(PqCommMethods->writemessage(msgtype,msgsize,bufstart,bufend))
+#define pq_enlargebuffer(newsize) \
+	(PqCommMethods->enlargebuffer(newsize))
 
 /*
  * External functions.

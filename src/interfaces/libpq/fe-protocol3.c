@@ -452,10 +452,11 @@ pqParseInput3(PGconn *conn)
 				{
 					char *result_buffer;
 					if (USE_COMPRESSION) {
+						snappy_status ret = SNAPPY_OK;
 						int message_length = msgLength;
 						size_t uncompressed_length = CHUNK_SIZE;
-						if (snappy_uncompress(conn->inBuffer + 5, message_length, rsinfo.result_buffer, &uncompressed_length) != SNAPPY_OK) {
-							printf("Failed to decompress {%d}.\n", msgLength);
+						if ((ret = snappy_uncompress(conn->inBuffer + 5, message_length, rsinfo.result_buffer, &uncompressed_length)) != SNAPPY_OK) {
+							printf("Failed to decompress {CompressedLength=%d, ChunkSize=%d}: %s.\n", message_length, CHUNK_SIZE, ret == SNAPPY_INVALID_INPUT ? "Invalid input" : "Buffer too small");
 						} else {
 							//printf("Successfully decompressed {%d -> %d}\n", msgLength, uncompressed_length);
 						}
@@ -465,7 +466,6 @@ pqParseInput3(PGconn *conn)
 					}
 					int rows = (*(int*)(result_buffer));
 					int nullmask_size = (*(int*)(result_buffer + 4));
-					//printf("Rows: %d/%d\n", rows, rows_per_chunk);
 					char **basepointers = malloc(sizeof(char*) * rsinfo.natts);
 					char **nullmaskpointers = malloc(sizeof(char*) * rsinfo.natts);
 					int nullmask_byte = 0, nullmask_bit = 0;
@@ -477,7 +477,9 @@ pqParseInput3(PGconn *conn)
 						basepointers[i - 1] += sizeof(int);
 					}
 					basepointers[rsinfo.natts - 1] += sizeof(int);
-					for(int r = 0; r < rows; r++) {
+					for(int r = 0; r < rows; ++r) {
+						//nullmask_byte += nullmask_bit % 7;
+						//nullmask_bit = (nullmask_bit + 1) % 8;
 						nullmask_bit++;
 						if (nullmask_bit == 8) {
 							nullmask_bit = 0;
@@ -537,7 +539,6 @@ pqParseInput3(PGconn *conn)
 #ifdef PRINT_OUTPUT
 					printf("\n");
 #endif
-
 					conn->inCursor += msgLength;
 				}
 					/*
