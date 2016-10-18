@@ -69,6 +69,7 @@ typedef struct  {
 static ResultSetInformation rsinfo;
 
 static int USE_COMPRESSION = false;
+static int CHUNK_SIZE = 1000000;
 
 #define eightalign(sz) ((sz + 7) & ~7)
 
@@ -427,7 +428,7 @@ pqParseInput3(PGconn *conn)
 					char *buffer = conn->inBuffer + 5;
 					USE_COMPRESSION = ntohl(*((int*) buffer));
 					buffer += 4;
-					int chunk_size = ntohl(*((int*) buffer));
+					CHUNK_SIZE = ntohl(*((int*) buffer));
 					buffer += 4;
 					rsinfo.natts = ntohl(*((int*) buffer));
 					buffer += 4;
@@ -442,18 +443,21 @@ pqParseInput3(PGconn *conn)
 						buffer += 4;
 					}
 					if (USE_COMPRESSION) {
-						rsinfo.result_buffer = malloc(chunk_size);
+						rsinfo.result_buffer = malloc(CHUNK_SIZE);
 					}
-					break;
+					conn->inCursor += msgLength;
 				}
+					break;
 				case '*':
 				{
 					char *result_buffer;
 					if (USE_COMPRESSION) {
-						int message_length = ntohl(*(int*)(conn->inBuffer + 1)) - 4;
-						size_t uncompressed_length;
+						int message_length = msgLength;
+						size_t uncompressed_length = CHUNK_SIZE;
 						if (snappy_uncompress(conn->inBuffer + 5, message_length, rsinfo.result_buffer, &uncompressed_length) != SNAPPY_OK) {
-							printf("Failed to decompress.\n");
+							printf("Failed to decompress {%d}.\n", msgLength);
+						} else {
+							//printf("Successfully decompressed {%d -> %d}\n", msgLength, uncompressed_length);
 						}
 						result_buffer = rsinfo.result_buffer;
 					} else {

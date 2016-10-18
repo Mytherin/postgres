@@ -523,7 +523,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			if (snappy_compress(rsbuf.copybuffer, buffer - rsbuf.copybuffer, rsbuf.compression_buffer, &compressed_length) != SNAPPY_OK) {
 				printf("Failed to compress data.\n");
 			} else {
-				printf("Succeeded in compressing {%zu -> %zu}.\n", buffer - rsbuf.copybuffer, compressed_length);
+				//printf("Succeeded in compressing {%zu -> %zu}.\n", buffer - rsbuf.copybuffer, compressed_length);
 			}
 			uint32		n32;
 			n32 = htonl((uint32) (compressed_length + 4));
