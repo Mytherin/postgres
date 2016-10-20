@@ -197,12 +197,15 @@ typedef struct  {
 static bool initialized = false;
 static ResultSetBuffer rsbuf;
 
+<<<<<<< HEAD
 static int USE_COMPRESSION = true;
 static int MAX_COMPRESSED_LENGTH = 1000000;
 
 //#define ROWWISE_COPY
 #define PROTOCOL_NULLMASK
 
+=======
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 // align number to nearest multiple of eight (e.g. eightalign(15) = 16, eightalign(8) = 8, eightalign(9) = 16)
 #define eightalign(sz) ((sz + 7) & ~7)
 
@@ -247,9 +250,7 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 			pq_enlargebuffer(CHUNK_SIZE);
 		}
 	} else {
-#ifdef PROTOCOL_NULLMASK
 		free(rsbuf.bitmask_pointers);
-#endif
 		free(rsbuf.base_pointers);
 		free(rsbuf.data_pointers);
 		free(rsbuf.data_is_string);
@@ -261,9 +262,7 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	rsbuf.total_tuples_send = 0;
 	rsbuf.total_tuples = 0; // FIXME
 	rsbuf.count = 0;
-#ifdef PROTOCOL_NULLMASK
 	rsbuf.bitmask_pointers = malloc(sizeof(char*) * natts);
-#endif
 	rsbuf.base_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_is_string = malloc(sizeof(bool) * natts);
@@ -271,13 +270,15 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	rsbuf.data_not_null = malloc(sizeof(bool) * natts);
 
 	// rowsize in bits
-#ifdef PROTOCOL_NULLMASK
 	rowsize = natts; // reserve one bit per attribute for the null mask
+<<<<<<< HEAD
 #else
 	rowsize = 0;
 #endif
 
 	size_t bytes_left = CHUNK_SIZE - sizeof(int) * natts  - sizeof(size_t) - 1;
+=======
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 	for (i = 0; i < natts; ++i) {
 		char category;
 		bool preferred;
@@ -295,27 +296,31 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		rowsize += attribute_length * 8; //attribute length is given in bytes; convert to bits
 		Assert(attribute_length > 0); // FIXME: deal with Blobs
 	}
-#ifdef PROTOCOL_NULLMASK
 	// only consider chunks of eight rows for easy bitmask alignment
+<<<<<<< HEAD
 	rsbuf.tuples_per_chunk = eightalign((8 * 8 * (bytes_left)) / (8 * rowsize)) - 8;
 #else
 	rsbuf.tuples_per_chunk = (8 * 8 * (bytes_left)) / (8 * rowsize);
 #endif
+=======
+	rsbuf.tuples_per_chunk = (8 * 8 * (CHUNK_SIZE - sizeof(size_t) - 1)) / (8 * rowsize);
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 
-#ifdef PROTOCOL_NULLMASK
 	// bitmask size per column in bytes
 	size_t bitmask_size = eightalign(rsbuf.tuples_per_chunk) / 8;
-#endif
-
-	baseptr = rsbuf.buffer + sizeof(size_t) + sizeof(int) + sizeof(char); // new result set message
+	baseptr = rsbuf.buffer + sizeof(size_t); // new result set message
 	for (i = 0; i < natts; ++i) {
-#ifdef PROTOCOL_NULLMASK
 		rsbuf.bitmask_pointers[i] = baseptr;
+<<<<<<< HEAD
 		if (!rsbuf.data_not_null[i]) {
 			memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with 0 values
 			baseptr += bitmask_size;
 		}
 #endif
+=======
+		baseptr += bitmask_size;
+		memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with NULL values
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 
 		rsbuf.base_pointers[i] = baseptr;
 		rsbuf.data_pointers[i] = rsbuf.base_pointers[i] + sizeof(int);
@@ -450,7 +455,10 @@ printtup_prepare_info(DR_printtup *myState, TupleDesc typeinfo, int numAttrs)
 	}
 }
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 /* ----------------
  *		printtup --- print a tuple in protocol 3.0
  * ----------------
@@ -478,6 +486,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	rsbuf.count++;
 	// copy the data of this row into the buffer
 	for (i = 0; i < natts; ++i) {
+<<<<<<< HEAD
 		if (!rsbuf.data_not_null[i] && slot->tts_isnull[i]) {
 #ifdef PROTOCOL_NULLMASK
 			// set bit in null mask
@@ -493,13 +502,29 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
 			}
 #endif
+=======
+		char *buffer_pointer = rsbuf.data_pointers[i];
+		Datum attr = slot->tts_values[i];
+		if (slot->tts_isnull[i]) {
+			// set bit in null mask
+			size_t byte = rsbuf.count / 8;
+			int bit = rsbuf.count % 8;
+			rsbuf.bitmask_pointers[i][byte] |= 1 << bit;
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 		} else {
 			Datum attr = slot->tts_values[i];
 			if (rsbuf.data_is_string[i]) {
+<<<<<<< HEAD
 				int len = VARSIZE_ANY_EXHDR(attr);
 				memcpy(rsbuf.data_pointers[i], ((char*)attr) + 1, len);
 				rsbuf.data_pointers[i][len] = '\0';
 				rsbuf.data_pointers[i] += len + 1;
+=======
+				memcpy(buffer_pointer, ((char*)attr) + 1, rsbuf.attribute_lengths[i]);
+				// todo: proper strcpy for varchar
+				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
+				rsbuf.data_pointers[i][-1] = '\0';
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 			} else {
 				memcpy(rsbuf.data_pointers[i], &attr, rsbuf.attribute_lengths[i]);
 				rsbuf.data_pointers[i] += rsbuf.attribute_lengths[i];
@@ -510,6 +535,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	if (rsbuf.count >= rsbuf.tuples_per_chunk || 
 		rsbuf.total_tuples_send + rsbuf.count == 1000000 || /* always transfer on 1M or 10M total tuples: hacky workaround for not knowing when we reach the end */
 		rsbuf.total_tuples_send + rsbuf.count == 10000000) {
+<<<<<<< HEAD
 		int nullmask_size = 0;
 		*((int*) (rsbuf.buffer + 5)) = (int) rsbuf.count; // amount of rows to send
 #ifdef PROTOCOL_NULLMASK
@@ -578,6 +604,11 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			}
 			pq_flush();
 		}
+=======
+		size_t chunk_data = rsbuf.data_pointers[natts - 1] - rsbuf.buffer + sizeof(size_t);
+		*((int*) rsbuf.buffer) = (int) rsbuf.count; // amount of rows to send
+		*((int*) (rsbuf.buffer + 4)) = (int) rsbuf.tuples_per_chunk; // amount of rows normally encoded in a chunk
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 /*
 
 		}
@@ -589,18 +620,17 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			// reset the base pointer for the next time something is send
 			rsbuf.data_pointers[i] = rsbuf.base_pointers[i] + sizeof(int);
 		}
-
-		// // actually send the message to the client
-		// //pq_putmessage_noblock('*', rsbuf.buffer + 5, chunk_data);
-		// if (pq_writemessage('*', chunk_data, rsbuf.buffer, rsbuf.data_pointers[natts - 1]) != 0) {
-		// 	return false;
-		// }
+		// actually send the message to the client
+		pq_putmessage('*', rsbuf.buffer, chunk_data);
 		rsbuf.total_tuples_send += rsbuf.count;
 		rsbuf.count = 0;
+<<<<<<< HEAD
 		//transmitted_size += chunk_data;
+=======
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 	}
-
 	return true;
+
 
 	/* Set or update my derived attribute info, if needed */
 	if (myState->attrinfo != typeinfo || myState->nattrs != natts)

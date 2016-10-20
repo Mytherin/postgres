@@ -32,8 +32,11 @@ typedef struct
 	void		(*putmessage_noblock) (char msgtype, const char *s, size_t len);
 	void		(*startcopyout) (void);
 	void		(*endcopyout) (bool errorAbort);
+<<<<<<< HEAD
 	int         (*writemessage) (char msgtype, size_t msgsize, char *bufptr, char *bufend);
 	void        (*enlargebuffer) (size_t newsize);
+=======
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 } PQcommMethods;
 
 extern PGDLLIMPORT PQcommMethods *PqCommMethods;
@@ -48,10 +51,13 @@ extern PGDLLIMPORT PQcommMethods *PqCommMethods;
 	(PqCommMethods->putmessage_noblock(msgtype, s, len))
 #define pq_startcopyout() (PqCommMethods->startcopyout())
 #define pq_endcopyout(errorAbort) (PqCommMethods->endcopyout(errorAbort))
+<<<<<<< HEAD
 #define pq_writemessage(msgtype,msgsize,bufstart,bufend) \
 	(PqCommMethods->writemessage(msgtype,msgsize,bufstart,bufend))
 #define pq_enlargebuffer(newsize) \
 	(PqCommMethods->enlargebuffer(newsize))
+=======
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 
 /*
  * External functions.

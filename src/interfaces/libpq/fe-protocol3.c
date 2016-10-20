@@ -454,6 +454,7 @@ pqParseInput3(PGconn *conn)
 					break;
 				case '*':
 				{
+<<<<<<< HEAD
 					char *result_buffer;
 					if (USE_COMPRESSION) {
 						snappy_status ret = SNAPPY_OK;
@@ -461,6 +462,22 @@ pqParseInput3(PGconn *conn)
 						size_t uncompressed_length = CHUNK_SIZE;
 						if ((ret = snappy_uncompress(conn->inBuffer + 8, message_length, rsinfo.result_buffer, &uncompressed_length)) != SNAPPY_OK) {
 							printf("Failed to decompress {CompressedLength=%d, ChunkSize=%d}: %s.\n", message_length, CHUNK_SIZE, ret == SNAPPY_INVALID_INPUT ? "Invalid input" : "Buffer too small");
+=======
+					static int typelengths[] = {4, 4, 4, 4, 8, 8, 8, 8, 2, 2, 4, 4, 4, 26, 11, 45};
+					// FIXME: do something
+					//printf("Message Length: %zu\n", (size_t) msgLength);
+					int rows = (*(int*)(conn->inBuffer + 5));
+					int rows_per_chunk = (*(int*)(conn->inBuffer + 9));
+					//printf("Rows: %d/%d\n", rows, rows_per_chunk);
+					char *basepointers[16];
+					basepointers[0] = conn->inBuffer + 5 + sizeof(size_t);
+					for(int i = 1; i < 16; i++) {
+						if (typelengths[i - 1] < 0) {
+							size_t message_length = *((size_t*)basepointers[i - 1]);
+							//printf("Skipping %zu\n", message_length);
+							basepointers[i] = basepointers[i - 1] + message_length;
+							basepointers[i - 1] += sizeof(size_t);
+>>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 						} else {
 							//printf("Successfully decompressed {%d -> %d}\n", msgLength, uncompressed_length);
 						}
