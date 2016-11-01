@@ -143,11 +143,8 @@ static int	socket_putmessage(char msgtype, const char *s, size_t len);
 static void socket_putmessage_noblock(char msgtype, const char *s, size_t len);
 static void socket_startcopyout(void);
 static void socket_endcopyout(bool errorAbort);
-<<<<<<< HEAD
 static int  socket_writemessage(char msgtype, size_t msgsize, char *bufptr, char *bufend);
 static void socket_enlarge_buffer(size_t len);
-=======
->>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 static int	internal_putbytes(const char *s, size_t len);
 static int	internal_flush(void);
 
@@ -164,13 +161,9 @@ static PQcommMethods PqCommSocketMethods = {
 	socket_putmessage,
 	socket_putmessage_noblock,
 	socket_startcopyout,
-<<<<<<< HEAD
 	socket_endcopyout,
 	socket_writemessage,
 	socket_enlarge_buffer
-=======
-	socket_endcopyout
->>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 };
 
 PQcommMethods *PqCommMethods = &PqCommSocketMethods;
@@ -1322,8 +1315,6 @@ pq_putbytes(const char *s, size_t len)
 {
 	int			res;
 
-	/* Should only be called by old-style COPY OUT */
-	Assert(DoingCopyOut);
 	/* No-op if reentrant call */
 	if (PqCommBusy)
 		return 0;
@@ -1589,7 +1580,6 @@ socket_enlarge_buffer(size_t len) {
 }
 
 
-<<<<<<< HEAD
 // ugly wrapper around internal_flush that sends a custom buffer over the stream 
 static int
 socket_writemessage(char msgtype, size_t msgsize, char *bufptr, char *bufend) {
@@ -1636,8 +1626,6 @@ socket_writemessage(char msgtype, size_t msgsize, char *bufptr, char *bufend) {
 }
 
 
-=======
->>>>>>> parent of d38780b... Add nullmask and prevent unnecessary copy of data into buffer.
 /* --------------------------------
  *		socket_startcopyout - inform libpq that an old-style COPY OUT transfer
  *			is beginning
