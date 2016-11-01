@@ -34,6 +34,12 @@
 #endif
 
 #include <snappy-c.h>
+#define HAVE_PFOR
+#ifdef HAVE_PFOR
+#include <vint.h>
+#include <vp4dd.h>
+#endif
+ 
 
 /*
  * This macro lists the backend message types that could be "long" (more
@@ -460,7 +466,7 @@ pqParseInput3(PGconn *conn)
 						int message_length = msgLength - 3;
 						size_t uncompressed_length = CHUNK_SIZE;
 						if ((ret = snappy_uncompress(conn->inBuffer + 8, message_length, rsinfo.result_buffer, &uncompressed_length)) != SNAPPY_OK) {
-							printf("Failed to decompress {CompressedLength=%d, ChunkSize=%d}: %s.\n", message_length, CHUNK_SIZE, ret == SNAPPY_INVALID_INPUT ? "Invalid input" : "Buffer too small");
+							//printf("Failed to decompress {CompressedLength=%d, ChunkSize=%d}: %s.\n", message_length, CHUNK_SIZE, ret == SNAPPY_INVALID_INPUT ? "Invalid input" : "Buffer too small");
 						} else {
 							//printf("Successfully decompressed {%d -> %d}\n", msgLength, uncompressed_length);
 						}
@@ -473,14 +479,35 @@ pqParseInput3(PGconn *conn)
 					char **basepointers = malloc(sizeof(char*) * rsinfo.natts);
 					char **nullmaskpointers = malloc(sizeof(char*) * rsinfo.natts);
 					int nullmask_byte = 0, nullmask_bit = 0;
-					nullmaskpointers[0] = result_buffer + 8;
-					basepointers[0] = nullmaskpointers[0] + nullmask_size;
+					char *nextpointer = result_buffer + 8;
 					for(int i = 1; i < rsinfo.natts; i++) {
-						nullmaskpointers[i] = basepointers[i - 1] + *((int*)(basepointers[i - 1]));
+						nullmaskpointers[i] = nextpointer;
 						basepointers[i] = rsinfo.data_not_null[i] ? nullmaskpointers[i] : nullmaskpointers[i] + nullmask_size;
-						basepointers[i - 1] += sizeof(int);
+						nextpointer = basepointers[i] + *((int*)(basepointers[i]));
+						basepointers[i] += sizeof(int);
+#ifdef HAVE_PFOR
+						if (USE_COMPRESSION && rsinfo.types[i] == 2 && rsinfo.typelengths[i] == 4) {
+						       // four-byte integer, decompress PFOR
+						       char *decompressed_buffer = malloc(sizeof(int) * rows);
+						       char *bufpos = decompressed_buffer;
+						       char *buf = basepointers[i];
+						       int n = rows;
+						       while(n > 0) {
+						               size_t elements = n > 128 ? 128 : n;
+						               if (elements < 128) {
+						                       memcpy(bufpos, buf, elements * sizeof(int));
+						                       buf += elements * sizeof(int);
+						               } else {
+						                       buf = p4ddecv32(buf, elements, bufpos);
+						               }
+						               bufpos += elements * sizeof(int);
+						               n -= elements;
+						       }
+						       //printf("PFOR Decompression Successful (%d -> %d)\n", buf - basepointers[i], sizeof(int) * rows);
+						       basepointers[i] = decompressed_buffer;
+						}
+#endif
 					}
-					basepointers[rsinfo.natts - 1] += sizeof(int);
 					for(int r = 0; r < rows; ++r) {
 						//nullmask_byte += nullmask_bit / 7;
 						//nullmask_bit = (nullmask_bit + 1) % 8;

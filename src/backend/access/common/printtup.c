@@ -24,6 +24,13 @@
 #include "utils/memutils.h"
 
 #include <snappy-c.h>
+#define HAVE_PFOR
+#ifdef HAVE_PFOR
+#include <vint.h>
+#include <vp4dc.h>
+#include <vp4dd.h>
+#endif
+
 
 static void printtup_startup(DestReceiver *self, int operation,
 				 TupleDesc typeinfo);
@@ -539,9 +546,45 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			memcpy(buffer,&nullmask_size, 4);
 			buffer += 4;
 			for (i = 0; i < natts; ++i) {
-#ifdef PROTOCOL_NULLMASK
-				memcpy(buffer, rsbuf.bitmask_pointers[i], rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i]);
-				buffer += rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i];
+#ifdef PROTOCOL_NULLMASK		
+#ifdef HAVE_PFOR
+				if (rsbuf.attribute_lengths[i] == sizeof(int)) {
+				       int *length_pointer;
+				       int n = rsbuf.count;
+				       char *datain;
+				       char *bufstart;
+				       // first copy the bitmask into the buffer
+				       memcpy(buffer, rsbuf.bitmask_pointers[i], rsbuf.base_pointers[i] - rsbuf.bitmask_pointers[i]);
+				       buffer += rsbuf.base_pointers[i] - rsbuf.bitmask_pointers[i];
+				       // now compress the actual column data into the buffer using PFOR
+				       length_pointer = (int*) buffer;
+				       bufstart = buffer;
+				       buffer += sizeof(int);
+				       datain = rsbuf.base_pointers[i] + sizeof(int);
+				       while(n > 0) {
+				               int elements = n > 128 ? 128 : n;
+				               if (elements < 128) {
+				                       memcpy(buffer, datain, elements * sizeof(int));
+				                       buffer += elements * sizeof(int);
+				               } else {
+				                       buffer = p4dencv32(datain, elements, buffer);
+				                       if (!buffer) {
+				                               printf("PFOR compression failed.\n");
+				                               return -1;
+				                       }
+				               }
+				               datain += elements * sizeof(int);
+				               n -= elements;
+				       }
+				       *length_pointer = buffer - bufstart;
+				       //printf("PFOR Compression successful (%d -> %d)\n", (int)(rsbuf.count * sizeof(int)), (int)(buffer - bufstart));
+				} else 
+#endif
+				{
+				       // copy all the data of this column into the buffer
+				       memcpy(buffer, rsbuf.bitmask_pointers[i], rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i]);
+				       buffer += rsbuf.data_pointers[i] - rsbuf.bitmask_pointers[i];
+				}
 #else
 				memcpy(buffer, rsbuf.base_pointers[i], rsbuf.data_pointers[i] - rsbuf.base_pointers[i]);
 				buffer += rsbuf.data_pointers[i] - rsbuf.base_pointers[i];
