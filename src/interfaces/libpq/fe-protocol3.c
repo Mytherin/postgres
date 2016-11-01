@@ -480,7 +480,7 @@ pqParseInput3(PGconn *conn)
 					char **nullmaskpointers = malloc(sizeof(char*) * rsinfo.natts);
 					int nullmask_byte = 0, nullmask_bit = 0;
 					char *nextpointer = result_buffer + 8;
-					for(int i = 1; i < rsinfo.natts; i++) {
+					for(int i = 0; i < rsinfo.natts; i++) {
 						nullmaskpointers[i] = nextpointer;
 						basepointers[i] = rsinfo.data_not_null[i] ? nullmaskpointers[i] : nullmaskpointers[i] + nullmask_size;
 						nextpointer = basepointers[i] + *((int*)(basepointers[i]));
