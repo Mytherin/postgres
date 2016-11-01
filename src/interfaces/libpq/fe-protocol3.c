@@ -68,7 +68,6 @@ typedef struct  {
 	int natts;
 	int *typelengths;
 	int *types;
-	bool *data_not_null;
 	int nullmask_size;
 	char *result_buffer;
 } ResultSetInformation;
@@ -443,13 +442,10 @@ pqParseInput3(PGconn *conn)
 					buffer += 4;
 					rsinfo.typelengths = malloc(rsinfo.natts * sizeof(int));
 					rsinfo.types = malloc(rsinfo.natts * sizeof(int));
-					rsinfo.data_not_null = malloc(rsinfo.natts * sizeof(bool));
 					for(int i = 0; i < rsinfo.natts; i++) {
 						rsinfo.typelengths[i] = ntohl(*((int*) buffer));
 						buffer += 4;
 						rsinfo.types[i] = ntohl(*((int*) buffer));
-						buffer += 4;
-						rsinfo.data_not_null[i] = ntohl(*((int*) buffer)) != 0;
 						buffer += 4;
 					}
 					if (USE_COMPRESSION) {
@@ -463,16 +459,16 @@ pqParseInput3(PGconn *conn)
 					char *result_buffer;
 					if (USE_COMPRESSION) {
 						snappy_status ret = SNAPPY_OK;
-						int message_length = msgLength - 3;
+						int message_length = msgLength;
 						size_t uncompressed_length = CHUNK_SIZE;
-						if ((ret = snappy_uncompress(conn->inBuffer + 8, message_length, rsinfo.result_buffer, &uncompressed_length)) != SNAPPY_OK) {
-							//printf("Failed to decompress {CompressedLength=%d, ChunkSize=%d}: %s.\n", message_length, CHUNK_SIZE, ret == SNAPPY_INVALID_INPUT ? "Invalid input" : "Buffer too small");
+						if ((ret = snappy_uncompress(conn->inBuffer + 5, message_length, rsinfo.result_buffer, &uncompressed_length)) != SNAPPY_OK) {
+							printf("Failed to decompress {CompressedLength=%d, ChunkSize=%d}: %s.\n", message_length, CHUNK_SIZE, ret == SNAPPY_INVALID_INPUT ? "Invalid input" : "Buffer too small");
 						} else {
 							//printf("Successfully decompressed {%d -> %d}\n", msgLength, uncompressed_length);
 						}
 						result_buffer = rsinfo.result_buffer;
 					} else {
-						result_buffer = conn->inBuffer + 8;
+						result_buffer = conn->inBuffer + 5;
 					}
 					int rows = (*(int*)(result_buffer));
 					int nullmask_size = (*(int*)(result_buffer + 4));
@@ -482,7 +478,7 @@ pqParseInput3(PGconn *conn)
 					char *nextpointer = result_buffer + 8;
 					for(int i = 0; i < rsinfo.natts; i++) {
 						nullmaskpointers[i] = nextpointer;
-						basepointers[i] = rsinfo.data_not_null[i] ? nullmaskpointers[i] : nullmaskpointers[i] + nullmask_size;
+						basepointers[i] = nullmaskpointers[i] + nullmask_size;
 						nextpointer = basepointers[i] + *((int*)(basepointers[i]));
 						basepointers[i] += sizeof(int);
 #ifdef HAVE_PFOR
@@ -509,7 +505,7 @@ pqParseInput3(PGconn *conn)
 #endif
 					}
 					for(int r = 0; r < rows; ++r) {
-						//nullmask_byte += nullmask_bit / 7;
+						//nullmask_byte += nullmask_bit % 7;
 						//nullmask_bit = (nullmask_bit + 1) % 8;
 						nullmask_bit++;
 						if (nullmask_bit == 8) {
@@ -553,7 +549,7 @@ pqParseInput3(PGconn *conn)
 							}
 #endif
 
-							if (rsinfo.data_not_null[i] || !(nullmaskpointers[i][nullmask_byte] & (1 << nullmask_bit))) {
+							if (!(nullmaskpointers[i][nullmask_byte] & (1 << nullmask_bit))) {
 								// not a null value; advance the pointer
 								if (rsinfo.types[i] == 1) { // STRING, so we have to scan for the null byte
 									basepointers[i] += strlen(basepointers[i]) + 1;
