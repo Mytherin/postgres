@@ -192,6 +192,7 @@ typedef struct  {
 	char **base_pointers;
 	char **data_pointers;
 	bool *data_is_string;
+	bool *data_not_null;
 	size_t *attribute_lengths;
 	size_t transferred_count;
 	size_t tuples_per_chunk;
@@ -256,6 +257,7 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		free(rsbuf.data_pointers);
 		free(rsbuf.data_is_string);
 		free(rsbuf.attribute_lengths);
+		free(rsbuf.data_not_null);
 	}
 	rsbuf.transferred_count = 0;
 	rsbuf.tuples_per_chunk = 0;
@@ -269,6 +271,7 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	rsbuf.data_pointers = malloc(sizeof(char*) * natts);
 	rsbuf.data_is_string = malloc(sizeof(bool) * natts);
 	rsbuf.attribute_lengths = malloc(sizeof(size_t) * natts);
+	rsbuf.data_not_null = malloc(sizeof(bool) * natts);
 
 	// rowsize in bits
 #ifdef PROTOCOL_NULLMASK
@@ -289,6 +292,10 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 		if (category == 'D') {
 			attribute_length = 4; // dates are stored as 4-byte integers
 		}
+		if (category == 'N' && attribute_length < 0) {
+			attribute_length = 4;
+		}
+		rsbuf.data_not_null[i] = attrs[i]->attnotnull;
 		rsbuf.attribute_lengths[i] = attribute_length;
 		rowsize += attribute_length * 8; //attribute length is given in bytes; convert to bits
 		Assert(attribute_length > 0); // FIXME: deal with Blobs
@@ -309,8 +316,10 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 	for (i = 0; i < natts; ++i) {
 #ifdef PROTOCOL_NULLMASK
 		rsbuf.bitmask_pointers[i] = baseptr;
-		memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with 0 values
-		baseptr += bitmask_size;
+		if (!rsbuf.data_not_null[i]) {
+			memset(rsbuf.bitmask_pointers[i], 0, bitmask_size); // fill the bitmask with 0 values
+			baseptr += bitmask_size;
+		}
 #endif
 
 		rsbuf.base_pointers[i] = baseptr;
@@ -333,7 +342,9 @@ SendRowDescriptionMessage(TupleDesc typeinfo, List *targetlist, int16 *formats)
 			type = 1;
 		}
 		// FIXME: floating point values not handled correctly here (they should be type = 3)
-		pq_sendint(&buf, type, 4); // type of the tuple (for printing purposes only)
+		pq_sendint(&buf, type, 4); // type of the tuple (for printing purposes only)		
+		// whether or not there are NULL values in this column
+		pq_sendint(&buf, rsbuf.data_not_null[i], 4);
 	}
 	pq_endmessage(&buf);
 
@@ -460,15 +471,16 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	slot_getallattrs(slot);
 
 	rsbuf.count++;
+	// set bit in null mask
+	size_t byte = rsbuf.count / 8;
+	int bit = rsbuf.count % 8;
+	int or_bit = 1 << bit;
 	// copy the data of this row into the buffer
 	for (i = 0; i < natts; ++i) {
 		Datum attr = slot->tts_values[i];
-		if (slot->tts_isnull[i]) {
+		if (!rsbuf.data_not_null[i] && slot->tts_isnull[i]) {
 #ifdef PROTOCOL_NULLMASK
-			// set bit in null mask
-			size_t byte = rsbuf.count / 8;
-			int bit = rsbuf.count % 8;
-			rsbuf.bitmask_pointers[i][byte] |= 1 << bit;
+			rsbuf.bitmask_pointers[i][byte] |= or_bit;
 #else
 			if (rsbuf.data_is_string[i]) {
 				// NULL value is an illegal UTF-8 bit
